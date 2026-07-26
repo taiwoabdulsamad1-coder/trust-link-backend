@@ -1,0 +1,36 @@
+{
+  "default_branch": "dev",
+  "branches": [
+    "chore/build-health",
+    "chore/repo-workflow",
+    "dev",
+    "fix/auth-guard-bypass",
+    "fix/move-integration-spec-to-test-dir",
+    "fix/move-vendor-account-details-integration-spec",
+    "main",
+    "origin",
+    "revert-26-feat/sep10-auth-verify"
+  ],
+  "parent": {
+    "chore/build-health": "dev",
+    "chore/repo-workflow": "dev",
+    "dev": null,
+    "fix/auth-guard-bypass": "dev",
+    "fix/move-integration-spec-to-test-dir": "dev",
+    "fix/move-vendor-account-details-integration-spec": "dev",
+    "main": "dev",
+    "origin": "dev",
+    "revert-26-feat/sep10-auth-verify": "dev"
+  },
+  "order": [
+    "dev",
+    "chore/build-health",
+    "chore/repo-workflow",
+    "fix/auth-guard-bypass",
+    "fix/move-integration-spec-to-test-dir",
+    "fix/move-vendor-account-details-integration-spec",
+    "main",
+    "origin",
+    "revert-26-feat/sep10-auth-verify"
+  ]
+}
