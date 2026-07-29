@@ -23,3 +23,6 @@ upload_issues.sh
 WAVE_ISSUES.md
 .github/copilot-instructions.md
 /data
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
