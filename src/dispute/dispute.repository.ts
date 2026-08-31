@@ -4,6 +4,7 @@ import {
   DisputeState,
   EscrowState,
   PrismaService,
+  toDisputeRecord,
 } from '../prisma/prisma.service';
 
 @Injectable()
@@ -18,29 +19,36 @@ export class DisputeRepository {
     evidenceUrls?: string[];
     status?: DisputeState;
   }): Promise<DisputeRecord> {
-    return this.prisma.dispute.create({ data });
+    return this.prisma.dispute.create({ data }).then(toDisputeRecord);
   }
 
   /** Returns a dispute by its primary key, or null if not found. */
   findById(id: string): Promise<DisputeRecord | null> {
-    return this.prisma.dispute.findUnique({ where: { id } });
+    return this.prisma.dispute
+      .findUnique({ where: { id } })
+      .then((row) => (row ? toDisputeRecord(row) : null));
   }
 
   /** Returns the first dispute linked to the given escrow, or null if none exists. */
   findByEscrow(escrowId: string): Promise<DisputeRecord | null> {
-    return this.prisma.dispute.findFirst({ where: { escrowId } });
+    return this.prisma.dispute
+      .findFirst({ where: { escrowId } })
+      .then((row) => (row ? toDisputeRecord(row) : null));
   }
 
-  /** Returns all disputes in OPEN or UNDER_REVIEW status. */
+  /**
+   * Returns all disputes in OPEN or UNDER_REVIEW status.
+   *
+   * Kept rather than deleted (it has no production caller today, only a
+   * repository test) because an admin "open disputes" view is a natural near
+   * addition and the fix is a one-liner. The status filter is now a `where`
+   * clause so Postgres can use `@@index([status])` instead of loading every
+   * dispute row and filtering in memory (#670).
+   */
   findAllOpen(): Promise<DisputeRecord[]> {
     return this.prisma.dispute
-      .findMany()
-      .then((disputes) =>
-        disputes.filter(
-          (dispute) =>
-            dispute.status === 'OPEN' || dispute.status === 'UNDER_REVIEW',
-        ),
-      );
+      .findMany({ where: { status: { in: ['OPEN', 'UNDER_REVIEW'] } } })
+      .then((disputes) => disputes.map(toDisputeRecord));
   }
 
   /**
@@ -67,6 +75,6 @@ export class DisputeRepository {
       data: { state: escrowState, disputeId: null },
     });
 
-    return resolvedDispute;
+    return toDisputeRecord(resolvedDispute);
   }
 }

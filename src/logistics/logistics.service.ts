@@ -10,6 +10,7 @@ import {
   decryptCredential,
 } from '../common/sanitization/credential-encryption.util';
 import { PrismaService } from '../prisma/prisma.service';
+import { ConfigService } from '../config/config.service';
 
 /** Key used to identify the logistics provider's row in `ProviderCredential`. */
 export const LOGISTICS_CREDENTIAL_PROVIDER = 'logistics';
@@ -37,6 +38,9 @@ export class LogisticsService implements OnModuleInit {
 
   constructor(
     @Optional() @Inject(PrismaService) private readonly prisma?: PrismaService,
+    @Optional()
+    @Inject(ConfigService)
+    private readonly configService?: ConfigService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -73,9 +77,12 @@ export class LogisticsService implements OnModuleInit {
       }
     }
 
-    const envToken = process.env.GIGL_API_TOKEN;
+    const envToken = this.configService?.get<string>('LOGISTICS_API_KEY');
     if (envToken) {
-      this.apiKey = encryptCredential(envToken);
+      const key = this.configService?.get<string>('CREDENTIAL_ENCRYPTION_KEY');
+      if (key) {
+        this.apiKey = encryptCredential(envToken, key);
+      }
     }
   }
 
@@ -86,7 +93,13 @@ export class LogisticsService implements OnModuleInit {
    * The key is encrypted before being stored in memory for security.
    */
   setApiKey(key: string): void {
-    const encryptedKey = encryptCredential(key);
+    const encryptionKey = this.configService?.get<string>(
+      'CREDENTIAL_ENCRYPTION_KEY',
+    );
+    if (!encryptionKey) {
+      throw new Error('CREDENTIAL_ENCRYPTION_KEY is not configured');
+    }
+    const encryptedKey = encryptCredential(key, encryptionKey);
     this.apiKey = encryptedKey;
   }
 
@@ -101,7 +114,13 @@ export class LogisticsService implements OnModuleInit {
    * in memory for the lifetime of the instance.
    */
   async rotateApiKey(key: string): Promise<void> {
-    const encryptedKey = encryptCredential(key);
+    const encryptionKey = this.configService?.get<string>(
+      'CREDENTIAL_ENCRYPTION_KEY',
+    );
+    if (!encryptionKey) {
+      throw new Error('CREDENTIAL_ENCRYPTION_KEY is not configured');
+    }
+    const encryptedKey = encryptCredential(key, encryptionKey);
     this.apiKey = encryptedKey;
 
     if (this.prisma) {
@@ -125,7 +144,13 @@ export class LogisticsService implements OnModuleInit {
       return null;
     }
     try {
-      return decryptCredential(this.apiKey);
+      const encryptionKey = this.configService?.get<string>(
+        'CREDENTIAL_ENCRYPTION_KEY',
+      );
+      if (!encryptionKey) {
+        throw new Error('CREDENTIAL_ENCRYPTION_KEY is not configured');
+      }
+      return decryptCredential(this.apiKey, encryptionKey);
     } catch {
       throw new Error('Failed to decrypt logistics API key');
     }
@@ -145,14 +170,34 @@ export class LogisticsService implements OnModuleInit {
     this.apiKey = encryptedKey;
   }
 
-  /** Fetches normalized shipment status from the configured logistics provider. */
+  /**
+   * Fetches normalized shipment status for `trackingId` from the configured
+   * logistics provider.
+   *
+   * **Currently a stub**: the real provider call is not wired yet, so this
+   * always rejects with `Error("Logistics service is not configured ...")`
+   * regardless of `trackingId` or whether an API key is present. Callers
+   * must treat a rejection as "status unavailable", not "shipment not
+   * found". When the provider integration lands, the contract is a resolved
+   * {@link TrackingDetails} on success and a reject on a provider/transport
+   * error — retryable at the caller's discretion.
+   */
   getStatus(trackingId: string): Promise<TrackingDetails> {
     return Promise.reject(
       new Error(`Logistics service is not configured for ${trackingId}`),
     );
   }
 
-  /** Fetches detailed tracking information including events from the logistics provider. */
+  /**
+   * Fetches detailed tracking information (status + the `events` timeline)
+   * for `trackingId`.
+   *
+   * Today this is a thin delegate to {@link getStatus} — there is no
+   * separate "details" endpoint yet — so it shares that method's stub
+   * behaviour and **always rejects** on the current build. Kept as a
+   * distinct method so callers that want the event history bind to a stable
+   * name once the provider call is implemented.
+   */
   getTrackingDetails(trackingId: string): Promise<TrackingDetails> {
     return this.getStatus(trackingId);
   }

@@ -147,11 +147,38 @@ export class EscrowService {
       throw new ConflictException('Duplicate escrow for this item reference');
     }
 
+    await this.ensureVendorProfile(vendorAddress);
+
     const escrow = await this.escrowRepository.create(dto, vendorAddress);
     return {
       ...escrow,
       paymentUrl: this.buildPaymentUrl(escrow.id),
     };
+  }
+
+  /**
+   * Guarantees the vendor has a VendorProfile row before an escrow references
+   * it.
+   *
+   * `Escrow.vendorAddress` is a foreign key onto `VendorProfile.address`. The
+   * previous in-memory store enforced no constraints, so a vendor could create
+   * an escrow without ever registering a profile. Against the real database
+   * (#475) that same request fails with
+   * `Foreign key constraint violated on the constraint: Escrow_vendorAddress_fkey`,
+   * surfacing as a 500 for every first-time vendor.
+   *
+   * The caller's address comes from a verified SEP-10 token, so creating a
+   * minimal profile here is safe: the vendor can fill in the real business
+   * details later via the vendor profile endpoints. `upsert` with an empty
+   * `update` leaves an existing profile untouched.
+   */
+  private async ensureVendorProfile(vendorAddress: string): Promise<void> {
+    if (!this.prisma) return;
+    await this.prisma.vendorProfile.upsert({
+      where: { address: vendorAddress },
+      create: { address: vendorAddress, businessName: vendorAddress },
+      update: {},
+    });
   }
 
   /** Wrapper for createEscrow that ensures idempotency via Redis caching. */
@@ -380,13 +407,29 @@ export class EscrowService {
       );
     }
 
-    const chainState = await this.contractService.getEscrowState(escrowId);
+    // Both contract calls address the escrow by the contract's own u64. An
+    // unmapped escrow has no on-chain counterpart to inspect or cancel, so the
+    // chain step is skipped rather than guessed at; the backend-side
+    // cancellation below still applies.
+    if (escrow.contractEscrowId === null) {
+      this.logger.log(
+        `Escrow ${escrowId} has no contractEscrowId; skipping the on-chain cancellation check`,
+      );
+      return this.escrowRepository.markCancelled(escrowId);
+    }
+
+    const chainState = await this.contractService.getEscrowState(
+      escrow.contractEscrowId,
+    );
 
     if (chainState.exists && chainState.state === 'FUNDED') {
       this.logger.log(
         `Escrow ${escrowId} funded on-chain — submitting on-chain refund before cancellation`,
       );
-      const txHash = await this.contractService.cancelEscrowOnChain(escrowId);
+      const txHash = await this.contractService.cancelEscrowOnChain(
+        escrow.contractEscrowId,
+        callerAddress,
+      );
       this.logger.log(
         `On-chain refund submitted for escrow ${escrowId}: ${txHash}`,
       );
@@ -515,6 +558,15 @@ export class EscrowService {
     );
 
     return { message: 'Buyer contact information saved.' };
+  }
+
+  /**
+   * Resolves a Soroban contract escrow id to the backend escrow's UUID.
+   * Delegates to the repository; see `findIdByContractEscrowId` there for why
+   * the two identifier spaces are separate.
+   */
+  findIdByContractEscrowId(contractEscrowId: bigint): Promise<string | null> {
+    return this.escrowRepository.findIdByContractEscrowId(contractEscrowId);
   }
 
   // ── Issue #40: on-chain event handler ─────────────────────────────────────

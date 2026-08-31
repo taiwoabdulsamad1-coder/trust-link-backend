@@ -33,6 +33,7 @@ import * as crypto from 'crypto';
 import type { ConnectionOptions } from 'bullmq';
 
 import { PrismaService } from '../prisma/prisma.service';
+import { ConfigService } from '../config/config.service';
 import {
   NotificationRetryJobData,
   NotificationRetryBackoff,
@@ -47,6 +48,16 @@ import {
  * `NotificationsService` can be reduced to this shape.
  */
 export interface NotificationChannelDispatcher {
+  /**
+   * Deliver one notification job over this channel (email or SMS).
+   *
+   * Contract: resolve on a successful send, **reject** on any failure. The
+   * queue owns retry/backoff and the DLQ, so a dispatcher must not swallow
+   * errors or retry internally — a rejection is how it signals "try again"
+   * (BullMQ backend) or "count this attempt" (in-process backend). Called
+   * once per attempt; may be called up to `backoff.attempts` times for the
+   * same job.
+   */
   dispatch(job: NotificationRetryJobData): Promise<void>;
 }
 
@@ -55,6 +66,16 @@ export interface NotificationChannelDispatcher {
  * landed on the DLQ.
  */
 export interface NotificationDeadLetterSink {
+  /**
+   * Receive one dead-letter entry — a job that exhausted every retry
+   * attempt.
+   *
+   * Called once per permanently-failed job, after the `Notification` row has
+   * already been marked `FAILED` and (when configured) the BullMQ DLQ has
+   * been written; this sink is the in-process / test-visible mirror of that.
+   * Implementations should not throw: an error here is logged by the queue
+   * but changes nothing, since the job is already dead.
+   */
   record(entry: NotificationDeadLetterRecord): Promise<void> | void;
 }
 
@@ -102,12 +123,25 @@ export class NotificationRetryQueueService
   constructor(
     @Optional() options?: CommonOptions,
     @Optional() private readonly prisma?: PrismaService,
+    @Optional() private readonly configService?: ConfigService,
   ) {
     if (options?.backoff) this.options.backoff = options.backoff;
     this.options.deadLetterSink = options?.deadLetterSink;
     this.options.scheduleDelayed = options?.scheduleDelayed;
   }
 
+  /**
+   * Bind the dispatcher used to actually send jobs for one channel.
+   *
+   * Must be called (for each channel that will be used) before any
+   * `enqueue` job for that channel is processed — a job whose channel has no
+   * registered dispatcher is dropped with a warning by the in-process
+   * runner, or throws inside the BullMQ worker. Wiring normally happens in
+   * `NotificationsModule` at startup.
+   *
+   * Last write wins: calling it again for the same channel replaces the
+   * previous dispatcher (used by tests). There is no unregister.
+   */
   registerDispatcher(
     channel: 'EMAIL' | 'SMS',
     dispatcher: NotificationChannelDispatcher,
@@ -190,7 +224,7 @@ export class NotificationRetryQueueService
             })
             .catch((dbErr) =>
               this.logger.error(
-                'Failed to update notification status to FAILED/PENDING',
+                'Failed to update notification status on error in worker',
                 dbErr,
               ),
             );
@@ -264,7 +298,7 @@ export class NotificationRetryQueueService
   }
 
   async onModuleInit(): Promise<void> {
-    const url = process.env.REDIS_URL;
+    const url = this.configService?.get<string>('REDIS_URL');
     if (!url) {
       this.logger.warn(
         'REDIS_URL is not set; NotificationRetryQueueService is using the in-process retry runner. ' +

@@ -5,6 +5,7 @@ import request from 'supertest';
 import { AppModule } from '../../src/app.module';
 import { PrismaService } from '../../src/prisma/prisma.service';
 import { bearer } from '../auth-helper';
+import { ensureVendors } from '../prisma-helpers';
 
 const VENDOR = 'GA36PERSXWPBG7HYKNBVT5PFLTOFYO4Q3CWGJZTYH5GU5OLTKHW7SJHE';
 const BUYER = 'GADRXQS5ZCXLBX6U67CY2WBJNDUXCWGHSQKR76AOJDQECYX36W5S6IYK';
@@ -27,6 +28,14 @@ describe('POST /escrow integration (issue #20)', () => {
     await app.init();
     prisma = app.get(PrismaService);
     await prisma.reset();
+    // Escrow.vendorAddress (and the vendor settings/details tables) are
+    // foreign keys onto VendorProfile.address, so the parent rows must exist
+    // before any row referencing them can be written (#475).
+    await ensureVendors(
+      prisma,
+      'GA36PERSXWPBG7HYKNBVT5PFLTOFYO4Q3CWGJZTYH5GU5OLTKHW7SJHE',
+      'GB3LCRCZEETCBYV4PEIPV2PD2R3AJMC6S2OOBMV5MA6WCOKEMN3XA3K3',
+    );
   });
 
   afterEach(async () => {
@@ -185,8 +194,8 @@ describe('POST /escrow integration (issue #20)', () => {
     expect(response.body.data[0].amount).toBeGreaterThanOrEqual(
       response.body.data[1].amount,
     );
-    expect(response.body.data.every((item: any) => item.id !== undefined)).toBe(
-      true,
-    );
+    expect(
+      response.body.data.every((item: { id: string }) => item.id !== undefined),
+    ).toBe(true);
   });
 });

@@ -15,7 +15,7 @@ describe('AutoReleaseWorker (issue #10)', () => {
   beforeEach(async () => {
     escrowRepository = {
       findAutoReleaseEligible: jest.fn(),
-      markAutoReleaseCompleted: jest.fn(),
+      recordAutoReleaseSubmission: jest.fn(),
       markAutoReleaseSubmitting: jest
         .fn()
         .mockImplementation((id: string) =>
@@ -44,6 +44,11 @@ describe('AutoReleaseWorker (issue #10)', () => {
           provide: ConfigService,
           useValue: {
             get: jest.fn((key: string) => process.env[key]),
+            requireAutoReleaseSourceAddress: jest.fn(
+              () =>
+                process.env.AUTO_RELEASE_SOURCE_ADDRESS ??
+                'GTESTAUTORELEASESOURCEADDRESSPLACEHOLDER0000000000000000',
+            ),
           },
         },
       ],
@@ -56,6 +61,7 @@ describe('AutoReleaseWorker (issue #10)', () => {
     escrowRepository.findAutoReleaseEligible.mockResolvedValue([
       {
         id: 'escrow-1',
+        contractEscrowId: 7n,
         itemName: 'Camera',
         amount: 250,
         currency: 'USDC',
@@ -79,10 +85,10 @@ describe('AutoReleaseWorker (issue #10)', () => {
     await worker.run(new Date('2026-05-26T00:00:00.000Z'));
 
     expect(contractService.submitAutoRelease).toHaveBeenCalledWith(
-      'escrow-1',
+      7n,
       expect.any(String),
     );
-    expect(escrowRepository.markAutoReleaseCompleted).toHaveBeenCalledWith(
+    expect(escrowRepository.recordAutoReleaseSubmission).toHaveBeenCalledWith(
       'escrow-1',
       'tx-hash',
     );
@@ -92,6 +98,7 @@ describe('AutoReleaseWorker (issue #10)', () => {
     escrowRepository.findAutoReleaseEligible.mockResolvedValue([
       {
         id: 'escrow-1',
+        contractEscrowId: 7n,
         itemName: 'Camera',
         amount: 250,
         currency: 'USDC',
@@ -131,7 +138,7 @@ describe('AutoReleaseWorker (issue #10)', () => {
       new Error('database unavailable'),
     );
     const loggerSpy = jest
-      .spyOn((worker as any).logger, 'error')
+      .spyOn(worker['logger'], 'error')
       .mockImplementation();
 
     await expect(worker.run()).resolves.toBeUndefined();

@@ -1,5 +1,18 @@
-import { EscrowState, DisputeStatus } from '@prisma/client';
-import { PrismaService, NotificationType } from '../src/prisma/prisma.service';
+import { PrismaService } from '../src/prisma/prisma.service';
+
+type EscrowState =
+  | 'CREATED'
+  | 'FUNDED'
+  | 'SHIPPED'
+  | 'DELIVERED'
+  | 'COMPLETED'
+  | 'RELEASED'
+  | 'DISPUTED'
+  | 'REFUNDED'
+  | 'CANCELLED';
+
+type DisputeState =
+  'OPEN' | 'UNDER_REVIEW' | 'RESOLVED' | 'CANCELLED' | 'ABANDONED';
 
 // Deterministic Stellar-like public keys for vendors and buyers
 const VENDORS = [
@@ -22,15 +35,28 @@ export const EXPECTED_COUNTS = {
   notifications: 10,
 };
 
+async function seedVendors(p: PrismaService): Promise<void> {
+  for (const address of VENDORS) {
+    await p.vendorProfile.upsert({
+      where: { address },
+      create: {
+        address,
+        businessName: `Vendor ${address.slice(0, 6)}`,
+      },
+      update: {},
+    });
+  }
+}
+
 async function seedEscrows(
   p: PrismaService,
 ): Promise<{ created: number; updated: number; ids: string[] }> {
   const states: EscrowState[] = [
-    EscrowState.CREATED,
-    EscrowState.FUNDED,
-    EscrowState.SHIPPED,
-    EscrowState.DELIVERED,
-    EscrowState.COMPLETED,
+    'CREATED',
+    'FUNDED',
+    'SHIPPED',
+    'DELIVERED',
+    'COMPLETED',
   ];
 
   const escrowRefs: string[] = [];
@@ -44,7 +70,13 @@ async function seedEscrows(
     const amount = (100.5 + i * 50).toFixed(4);
     const itemRef = `REF-DET-${1000 + i}`;
 
-    const existing = await p.escrow.findFirst({ where: { itemRef } });
+    // Matched on the full unique key. `itemRef` alone is not unique — the
+    // schema declares @@unique([vendorAddress, itemRef]) — so looking it up on
+    // its own could match another vendor's row, skip the wrong escrow, and
+    // then violate the constraint on create.
+    const existing = await p.escrow.findUnique({
+      where: { vendorAddress_itemRef: { vendorAddress, itemRef } },
+    });
 
     if (existing) {
       escrowRefs.push(existing.id);
@@ -60,15 +92,15 @@ async function seedEscrows(
           vendorAddress,
           state,
           trackingId:
-            state === EscrowState.SHIPPED ||
-            state === EscrowState.DELIVERED ||
-            state === EscrowState.COMPLETED
+            state === 'SHIPPED' ||
+            state === 'DELIVERED' ||
+            state === 'COMPLETED'
               ? `TRK-${2000 + i}`
               : null,
           shippedAt:
-            state === EscrowState.SHIPPED ||
-            state === EscrowState.DELIVERED ||
-            state === EscrowState.COMPLETED
+            state === 'SHIPPED' ||
+            state === 'DELIVERED' ||
+            state === 'COMPLETED'
               ? new Date()
               : null,
         },
@@ -85,11 +117,16 @@ async function seedDisputes(
   p: PrismaService,
   escrowIds: string[],
 ): Promise<{ created: number; updated: number }> {
-  const disputes = [
-    { escrowId: escrowIds[0], status: DisputeStatus.OPEN, reason: 'Item not received' },
-    { escrowId: escrowIds[1], status: DisputeStatus.OPEN, reason: 'Damaged packaging' },
-    { escrowId: escrowIds[2], status: DisputeStatus.RESOLVED, reason: 'Defective item, resolved by refund' },
-  ];
+  const disputes: { escrowId: string; status: DisputeState; reason: string }[] =
+    [
+      { escrowId: escrowIds[0], status: 'OPEN', reason: 'Item not received' },
+      { escrowId: escrowIds[1], status: 'OPEN', reason: 'Damaged packaging' },
+      {
+        escrowId: escrowIds[2],
+        status: 'RESOLVED',
+        reason: 'Defective item, resolved by refund',
+      },
+    ];
 
   let created = 0;
   let updated = 0;
@@ -135,7 +172,7 @@ async function seedNotifications(
       await p.notification.create({
         data: {
           escrowId,
-          type: 'SHIPPED' as NotificationType,
+          type: 'SHIPPED',
           channel: 'EMAIL',
           recipientAddress,
           message,
@@ -153,17 +190,29 @@ export async function main(p?: PrismaService) {
   try {
     console.log('Starting database seed...');
 
-    const { created: escrowsCreated, updated: escrowsUpdated, ids: escrowIds } =
-      await seedEscrows(prisma);
-    console.log(`Escrows: ${escrowsCreated} created, ${escrowsUpdated} updated`);
+    await seedVendors(prisma);
+    console.log(`Vendors: ${VENDORS.length} ensured`);
+
+    const {
+      created: escrowsCreated,
+      updated: escrowsUpdated,
+      ids: escrowIds,
+    } = await seedEscrows(prisma);
+    console.log(
+      `Escrows: ${escrowsCreated} created, ${escrowsUpdated} updated`,
+    );
 
     const { created: disputesCreated, updated: disputesUpdated } =
       await seedDisputes(prisma, escrowIds);
-    console.log(`Disputes: ${disputesCreated} created, ${disputesUpdated} updated`);
+    console.log(
+      `Disputes: ${disputesCreated} created, ${disputesUpdated} updated`,
+    );
 
     const { created: notificationsCreated, updated: notificationsUpdated } =
       await seedNotifications(prisma, escrowIds);
-    console.log(`Notifications: ${notificationsCreated} created, ${notificationsUpdated} updated`);
+    console.log(
+      `Notifications: ${notificationsCreated} created, ${notificationsUpdated} updated`,
+    );
 
     const [escrows, disputes, notifications] = await Promise.all([
       prisma.escrow.findMany(),
@@ -177,9 +226,18 @@ export async function main(p?: PrismaService) {
     console.log(`  Notifications: ${notifications.length}`);
     console.log('Seeding completed successfully!');
   } catch (error) {
+    // Rethrown rather than exiting: main() is imported and called by
+    // test/seed.spec.ts, and process.exit there kills the Jest worker
+    // mid-run, taking down unrelated suites with no summary. Exiting is the
+    // CLI entrypoint's job, below.
     console.error('Seeding failed:', error);
-    process.exit(1);
+    throw error;
   }
 }
 
-main();
+// Only run when invoked directly (`npm run db:seed`). Importing this module —
+// as the spec does, to call main(prisma) with its own client — must not
+// trigger a second, concurrent seed against the default connection.
+if (require.main === module) {
+  main().catch(() => process.exit(1));
+}

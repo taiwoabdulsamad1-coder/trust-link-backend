@@ -1,16 +1,22 @@
 import { NotFoundException } from '@nestjs/common';
 import { DlqService } from '../../src/dlq/dlq.service';
+import { PrismaService } from '../../src/prisma/prisma.service';
+
+type PrismaFailedTransactionMock = {
+  create: jest.Mock;
+  findMany: jest.Mock;
+  findUnique: jest.Mock;
+  update: jest.Mock;
+  count: jest.Mock;
+};
+
+type PrismaMock = {
+  failedTransaction: PrismaFailedTransactionMock;
+};
 
 describe('DlqService (#74)', () => {
   let service: DlqService;
-  let prismaMock: {
-    failedTransaction: {
-      create: jest.Mock;
-      findMany: jest.Mock;
-      findUnique: jest.Mock;
-      update: jest.Mock;
-    };
-  };
+  let prismaMock: PrismaMock;
 
   const mockRecord = {
     id: 'test-id-1',
@@ -34,9 +40,10 @@ describe('DlqService (#74)', () => {
         findMany: jest.fn(),
         findUnique: jest.fn(),
         update: jest.fn(),
+        count: jest.fn(),
       },
     };
-    service = new DlqService(prismaMock as any);
+    service = new DlqService(prismaMock as unknown as PrismaService);
   });
 
   afterEach(() => {
@@ -97,20 +104,28 @@ describe('DlqService (#74)', () => {
       await service.abandon('a');
 
       prismaMock.failedTransaction.findMany.mockResolvedValue([mockRecord]);
-      expect(await service.list({ status: 'PENDING_REVIEW' })).toHaveLength(1);
+      prismaMock.failedTransaction.count.mockResolvedValue(1);
+      expect(
+        (await service.list({ status: 'PENDING_REVIEW' })).data,
+      ).toHaveLength(1);
 
       prismaMock.failedTransaction.findMany.mockResolvedValue([a]);
-      expect(await service.list({ status: 'ABANDONED' })).toHaveLength(1);
+      prismaMock.failedTransaction.count.mockResolvedValue(1);
+      expect((await service.list({ status: 'ABANDONED' })).data).toHaveLength(
+        1,
+      );
 
       prismaMock.failedTransaction.findMany.mockResolvedValue([
         { ...mockRecord, operation: 'recordDelivery' },
       ]);
-      expect(await service.list({ operation: 'recordDelivery' })).toHaveLength(
-        1,
-      );
+      prismaMock.failedTransaction.count.mockResolvedValue(1);
+      expect(
+        (await service.list({ operation: 'recordDelivery' })).data,
+      ).toHaveLength(1);
 
       prismaMock.failedTransaction.findMany.mockResolvedValue([mockRecord]);
-      expect(await service.list({ escrowId: 'e1' })).toHaveLength(1);
+      prismaMock.failedTransaction.count.mockResolvedValue(1);
+      expect((await service.list({ escrowId: 'e1' })).data).toHaveLength(1);
     });
 
     it('raises NotFoundException for an unknown id', async () => {

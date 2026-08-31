@@ -8,9 +8,11 @@ import {
   DisputeState,
   EscrowRecord,
   PrismaService,
+  toDisputeRecord,
 } from '../../prisma/prisma.service';
 import { EscrowRepository } from '../../escrow/escrow.repository';
 import { ContractService } from '../../stellar/contract.service';
+import { ConfigService } from '../../config/config.service';
 
 @Injectable()
 export class DisputeService {
@@ -18,7 +20,26 @@ export class DisputeService {
     private readonly escrowRepository: EscrowRepository,
     private readonly contractService: ContractService,
     private readonly prisma: PrismaService,
+    private readonly configService: ConfigService,
   ) {}
+
+  /**
+   * Returns the contract admin address, or throws.
+   *
+   * `resolve_dispute` calls `caller.require_auth()` and the contract only
+   * accepts an authorised resolver, so this is the address the call has to be
+   * made and signed with. Resolved on use rather than in the constructor so an
+   * unset value fails this path instead of application boot.
+   */
+  private requireAdminAddress(): string {
+    const address = this.configService.get<string>('ADMIN_ADDRESS');
+    if (!address) {
+      throw new ConflictException(
+        'ADMIN_ADDRESS is not configured; cannot resolve disputes on-chain.',
+      );
+    }
+    return address;
+  }
 
   async getDisputes(query: {
     status?: string;
@@ -30,18 +51,24 @@ export class DisputeService {
     page: number;
     limit: number;
   }> {
-    const page = query.page ?? 1;
-    const limit = query.limit ?? 20;
-    const allDisputes = await this.prisma.dispute.findMany({
-      where: query.status
-        ? { status: query.status as DisputeState }
-        : undefined,
-    });
+    const page = Math.max(1, query.page ?? 1);
+    const limit = Math.min(100, Math.max(1, query.limit ?? 20));
+    const skip = (page - 1) * limit;
 
-    const total = allDisputes.length;
-    const start = (page - 1) * limit;
-    const data = allDisputes.slice(start, start + limit);
-    return { data, total, page, limit };
+    const where = query.status
+      ? { status: query.status as DisputeState }
+      : undefined;
+
+    const [data, total] = await Promise.all([
+      this.prisma.dispute.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      this.prisma.dispute.count({ where }),
+    ]);
+    return { data: data.map(toDisputeRecord), total, page, limit };
   }
 
   /** Resolves a dispute by submitting the contract action and finalizing escrow state. */
@@ -58,7 +85,20 @@ export class DisputeService {
       throw new ConflictException('Dispute has already been resolved');
     }
 
-    await this.contractService.resolveDispute(escrowId, resolution);
+    // `resolve_dispute(env, caller: Address, escrow_id: u64, resolution)`
+    // addresses the escrow by the contract's own id, and require_auth()s the
+    // caller. Without the mapping there is no valid on-chain call to make.
+    if (escrow.contractEscrowId === null) {
+      throw new ConflictException(
+        'Escrow has no contractEscrowId, so the dispute cannot be resolved on-chain.',
+      );
+    }
+
+    await this.contractService.resolveDispute(
+      escrow.contractEscrowId,
+      resolution,
+      this.requireAdminAddress(),
+    );
 
     const dispute = await this.prisma.dispute.findFirst({
       where: { escrowId, status: 'OPEN' },

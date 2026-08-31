@@ -2,22 +2,48 @@ import axios from 'axios';
 import { Test } from '@nestjs/testing';
 import { LogisticsService } from '../../src/logistics/logistics.service';
 import { LogisticsModule } from '../../src/logistics/logistics.module';
+import type { PrismaService } from '../../src/prisma/prisma.service';
 import { ConfigService } from '../../src/config/config.service';
 import { GiglLogisticsService } from '../../src/logistics/gigl/gigl-logistics.service';
 import {
   GiglClient,
   GiglNetworkError,
+  GiglUnauthorizedError,
   GiglProviderError,
 } from '../../src/logistics/gigl/gigl.client';
 
-jest.mock('axios');
+// Issue #552: a bare `jest.mock('axios')` auto-mocks the entire module,
+// which replaces `axios.isAxiosError` with a `jest.fn()` that returns
+// `undefined`. GiglClient.fetchTracking's whole error-mapping branch is
+// gated on `axios.isAxiosError(err)`, so with the auto-mock that branch is
+// never taken and every fixture error re-throws as a bare Error regardless
+// of what `isAxiosError`/`response`/`code` was set on it. Spreading the
+// real module through keeps `isAxiosError` (and everything else) genuine
+// while still letting `axios.create` be mocked per-test.
+jest.mock('axios', () => {
+  const actual = jest.requireActual('axios');
+  // `create` is mocked at both the top level and under `default` — with
+  // esModuleInterop, `import axios from 'axios'` may resolve to either
+  // depending on how ts-jest/babel interop picks it up here, and both must
+  // be the *same* jest.fn() so `mockedAxios.create.mockReturnValue(...)` in
+  // beforeEach reliably controls whichever one `axios` actually is.
+  const mockCreate = jest.fn();
+  return {
+    __esModule: true,
+    ...actual,
+    create: mockCreate,
+    default: { ...actual, create: mockCreate },
+  };
+});
 const mockedAxios = axios as jest.Mocked<typeof axios>;
 
-// Restore the real isAxiosError check so GiglClient can properly classify
-// network errors vs provider errors vs non-Axios errors.
-mockedAxios.isAxiosError.mockImplementation(
-  (err: any) => err?.isAxiosError === true,
-);
+const encryptionKeyConfig = {
+  get: (key: string) => {
+    if (key === 'CREDENTIAL_ENCRYPTION_KEY') return 'a'.repeat(64);
+    if (key === 'LOGISTICS_API_KEY') return process.env.LOGISTICS_API_KEY;
+    return undefined;
+  },
+} as ConfigService;
 
 describe('LogisticsService & LogisticsModule (issue #479)', () => {
   let service: LogisticsService;
@@ -25,12 +51,14 @@ describe('LogisticsService & LogisticsModule (issue #479)', () => {
 
   beforeEach(() => {
     mockAxiosInstance = { get: jest.fn() };
-    mockedAxios.create.mockReturnValue(mockAxiosInstance as any);
+    mockedAxios.create.mockReturnValue(
+      mockAxiosInstance as unknown as ReturnType<typeof axios.create>,
+    );
   });
 
   describe('Runtime API key management', () => {
     beforeEach(() => {
-      service = new LogisticsService();
+      service = new LogisticsService(undefined, encryptionKeyConfig);
     });
 
     it('stores and returns the API key at runtime', () => {
@@ -51,7 +79,7 @@ describe('LogisticsService & LogisticsModule (issue #479)', () => {
 
     it('logs warning at startup when unconfigured', async () => {
       const loggerSpy = jest
-        .spyOn((service as any).logger, 'warn')
+        .spyOn(service['logger'], 'warn')
         .mockImplementation();
       await service.onModuleInit();
       expect(loggerSpy).toHaveBeenCalledWith(
@@ -70,14 +98,23 @@ describe('LogisticsService & LogisticsModule (issue #479)', () => {
       return {
         providerCredential: {
           findUnique: jest.fn(
-            async ({ where: { provider } }: any) => store.get(provider) ?? null,
+            async ({ where: { provider } }: { where: { provider: string } }) =>
+              store.get(provider) ?? null,
           ),
           upsert: jest.fn(
-            async ({ where: { provider }, update, create }: any) => {
+            async ({
+              where: { provider },
+              update,
+              create,
+            }: {
+              where: { provider: string };
+              update: { provider: string; encryptedKey: string };
+              create: { provider: string; encryptedKey: string };
+            }) => {
               const existing = store.get(provider);
               const record = existing
                 ? { ...existing, ...update }
-                : { provider, ...create };
+                : { ...create };
               store.set(provider, record);
               return record;
             },
@@ -89,7 +126,10 @@ describe('LogisticsService & LogisticsModule (issue #479)', () => {
 
     it('rotates to the submitted key on first set (nothing previously stored)', async () => {
       const prisma = createFakePrisma();
-      const svc = new LogisticsService(prisma as any);
+      const svc = new LogisticsService(
+        prisma as unknown as PrismaService,
+        encryptionKeyConfig,
+      );
 
       expect(svc.getApiKey()).toBeNull();
       await svc.rotateApiKey('first-key');
@@ -100,7 +140,10 @@ describe('LogisticsService & LogisticsModule (issue #479)', () => {
 
     it('rotates to the submitted key when a key already exists, and the stored value actually changes', async () => {
       const prisma = createFakePrisma();
-      const svc = new LogisticsService(prisma as any);
+      const svc = new LogisticsService(
+        prisma as unknown as PrismaService,
+        encryptionKeyConfig,
+      );
 
       await svc.rotateApiKey('old-key');
       const encryptedAfterFirst = svc.getEncryptedApiKey();
@@ -116,51 +159,66 @@ describe('LogisticsService & LogisticsModule (issue #479)', () => {
 
     it('persists the rotated key so a freshly constructed service instance loads it (issue #499)', async () => {
       const prisma = createFakePrisma();
-      const svc1 = new LogisticsService(prisma as any);
+      const svc1 = new LogisticsService(
+        prisma as unknown as PrismaService,
+        encryptionKeyConfig,
+      );
       await svc1.rotateApiKey('rotated-secret');
 
-      const svc2 = new LogisticsService(prisma as any);
+      const svc2 = new LogisticsService(
+        prisma as unknown as PrismaService,
+        encryptionKeyConfig,
+      );
       await svc2.onModuleInit();
 
       expect(svc2.getApiKey()).toBe('rotated-secret');
     });
 
-    it('falls back to the GIGL_API_TOKEN environment variable when nothing is persisted', async () => {
+    it('falls back to the LOGISTICS_API_KEY environment variable when nothing is persisted', async () => {
       const prisma = createFakePrisma();
-      const originalToken = process.env.GIGL_API_TOKEN;
-      process.env.GIGL_API_TOKEN = 'env-fallback-token';
+      const originalToken = process.env.LOGISTICS_API_KEY;
+      process.env.LOGISTICS_API_KEY = 'env-fallback-token';
 
       try {
-        const svc = new LogisticsService(prisma as any);
+        const svc = new LogisticsService(
+          prisma as unknown as PrismaService,
+          encryptionKeyConfig,
+        );
         await svc.onModuleInit();
         expect(svc.getApiKey()).toBe('env-fallback-token');
       } finally {
         if (originalToken === undefined) {
-          delete process.env.GIGL_API_TOKEN;
+          delete process.env.LOGISTICS_API_KEY;
         } else {
-          process.env.GIGL_API_TOKEN = originalToken;
+          process.env.LOGISTICS_API_KEY = originalToken;
         }
       }
     });
 
     it('prefers the persisted key over the environment variable', async () => {
       const prisma = createFakePrisma();
-      const originalToken = process.env.GIGL_API_TOKEN;
-      process.env.GIGL_API_TOKEN = 'env-fallback-token';
+      const originalToken = process.env.LOGISTICS_API_KEY;
+      process.env.LOGISTICS_API_KEY = 'env-fallback-token';
 
       try {
-        const svc1 = new LogisticsService(prisma as any);
+        const svc1 = new LogisticsService(
+          prisma as unknown as PrismaService,
+          encryptionKeyConfig,
+        );
         await svc1.rotateApiKey('rotated-secret');
 
-        const svc2 = new LogisticsService(prisma as any);
+        const svc2 = new LogisticsService(
+          prisma as unknown as PrismaService,
+          encryptionKeyConfig,
+        );
         await svc2.onModuleInit();
 
         expect(svc2.getApiKey()).toBe('rotated-secret');
       } finally {
         if (originalToken === undefined) {
-          delete process.env.GIGL_API_TOKEN;
+          delete process.env.LOGISTICS_API_KEY;
         } else {
-          process.env.GIGL_API_TOKEN = originalToken;
+          process.env.LOGISTICS_API_KEY = originalToken;
         }
       }
     });
@@ -170,8 +228,9 @@ describe('LogisticsService & LogisticsModule (issue #479)', () => {
     it('provides GiglLogisticsService and GiglClient when configured', async () => {
       const mockConfigService = {
         get: (key: string) => {
-          if (key === 'GIGL_API_BASE_URL') return 'https://api.gigl.com/v1';
-          if (key === 'GIGL_API_TOKEN') return 'test-token-123';
+          if (key === 'LOGISTICS_API_BASE_URL')
+            return 'https://api.gigl.com/v1';
+          if (key === 'LOGISTICS_API_KEY') return 'test-token-123';
           return undefined;
         },
       };
@@ -234,7 +293,10 @@ describe('LogisticsService & LogisticsModule (issue #479)', () => {
     });
 
     it('handles provider timeout (network error)', async () => {
-      const timeoutError = new Error('request timed out') as any;
+      const timeoutError = Object.assign(new Error('request timed out'), {
+        isAxiosError: true,
+        code: 'ECONNABORTED',
+      });
       timeoutError.isAxiosError = true;
       timeoutError.code = 'ECONNABORTED';
 
@@ -252,7 +314,10 @@ describe('LogisticsService & LogisticsModule (issue #479)', () => {
     });
 
     it('handles 404 response (provider error)', async () => {
-      const notFoundError = new Error('Not found') as any;
+      const notFoundError = Object.assign(new Error('Not found'), {
+        isAxiosError: true,
+        response: { status: 404 },
+      });
       notFoundError.isAxiosError = true;
       notFoundError.response = { status: 404 };
 
@@ -272,6 +337,43 @@ describe('LogisticsService & LogisticsModule (issue #479)', () => {
       );
     });
 
+    it('handles 401 response (unauthorized)', async () => {
+      const unauthorizedError = Object.assign(new Error('Unauthorized'), {
+        isAxiosError: true,
+        response: { status: 401 },
+      });
+      unauthorizedError.isAxiosError = true;
+      unauthorizedError.response = { status: 401 };
+
+      mockAxiosInstance.get.mockRejectedValue(unauthorizedError);
+
+      const giglClient = new GiglClient({
+        baseUrl: 'https://api.gigl.com/v1',
+        apiToken: 'test-token',
+      });
+      const giglService = new GiglLogisticsService(giglClient);
+
+      await expect(giglService.getStatus('TRK-401')).rejects.toThrow(
+        GiglUnauthorizedError,
+      );
+    });
+
+    it('propagates a non-Axios error unchanged', async () => {
+      const plainError = new Error('something else broke entirely');
+
+      mockAxiosInstance.get.mockRejectedValue(plainError);
+
+      const giglClient = new GiglClient({
+        baseUrl: 'https://api.gigl.com/v1',
+        apiToken: 'test-token',
+      });
+      const giglService = new GiglLogisticsService(giglClient);
+
+      // Issue #552 acceptance criteria: must be the *same* error, not
+      // wrapped/reclassified as one of the Gigl* error types.
+      await expect(giglService.getStatus('TRK-OTHER')).rejects.toBe(plainError);
+    });
+
     it('fails clearly and logs warning at startup when unconfigured', async () => {
       const mockConfigService = {
         get: () => undefined,
@@ -287,7 +389,7 @@ describe('LogisticsService & LogisticsModule (issue #479)', () => {
       const logisticsService = moduleRef.get(LogisticsService);
 
       const loggerSpy = jest
-        .spyOn((logisticsService as any).logger, 'warn')
+        .spyOn(logisticsService['logger'], 'warn')
         .mockImplementation();
 
       await logisticsService.onModuleInit();

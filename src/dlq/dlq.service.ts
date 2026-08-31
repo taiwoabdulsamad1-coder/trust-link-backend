@@ -1,9 +1,17 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
+import {
+  Prisma,
+  FailedTransaction as PrismaFailedTransaction,
+} from '@prisma/client';
+import {
+  PrismaService,
+  toFailedTransactionRecord,
+} from '../prisma/prisma.service';
 import {
   EnqueueFailedTransactionInput,
   FailedTransactionRecord,
   ListFailedTransactionsQuery,
+  PaginatedFailedTransactions,
   ReplayFn,
 } from './dlq.types';
 
@@ -20,6 +28,16 @@ export class DlqService {
 
   constructor(private readonly prisma: PrismaService) {}
 
+  /**
+   * Records a failed Stellar contract submission as a new
+   * `PENDING_REVIEW` dead-letter row for an operator to triage.
+   *
+   * Always inserts — there is no dedup on `escrowId` + `operation`, so a
+   * caller that retries its own submission and fails again should enqueue
+   * once, not per attempt (carry the running count in `input.attempts`).
+   * `ledgerFeedback` is stored as JSON; pass `null`/omit it to store SQL
+   * NULL rather than the JSON literal `null`.
+   */
   async enqueue(
     input: EnqueueFailedTransactionInput,
   ): Promise<FailedTransactionRecord> {
@@ -28,7 +46,10 @@ export class DlqService {
         operation: input.operation,
         escrowId: input.escrowId ?? null,
         errorMessage: input.errorMessage,
-        ledgerFeedback: input.ledgerFeedback ?? null,
+        ledgerFeedback:
+          input.ledgerFeedback == null
+            ? Prisma.DbNull
+            : (input.ledgerFeedback as Prisma.InputJsonValue),
         attempts: input.attempts ?? 1,
         status: 'PENDING_REVIEW',
       },
@@ -36,21 +57,53 @@ export class DlqService {
     return this.toRecord(record);
   }
 
+  /**
+   * Returns a page of dead-letter rows, newest first, with optional
+   * `status` / `operation` / `escrowId` filters.
+   *
+   * Pagination is clamped, not validated: `page` floors to 1 and `limit` is
+   * forced into `[1, 100]` (default 20), so an out-of-range query returns a
+   * best-effort page instead of a 400. `total` is the count for the same
+   * filter, so `Math.ceil(total / limit)` gives the page count.
+   */
   async list(
     query: ListFailedTransactionsQuery = {},
-  ): Promise<FailedTransactionRecord[]> {
-    const where: Record<string, unknown> = {};
+  ): Promise<PaginatedFailedTransactions> {
+    const page = Math.max(1, Number(query.page) || 1);
+    const rawLimit = Number(query.limit) || 20;
+    const limit = Math.min(100, Math.max(1, rawLimit));
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.FailedTransactionWhereInput = {};
     if (query.status) where.status = query.status;
     if (query.operation) where.operation = query.operation;
     if (query.escrowId) where.escrowId = query.escrowId;
 
-    const records = await this.prisma.failedTransaction.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
-    });
-    return records.map((r) => this.toRecord(r));
+    const [records, total] = await Promise.all([
+      this.prisma.failedTransaction.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      this.prisma.failedTransaction.count({ where }),
+    ]);
+
+    return {
+      data: records.map((r) => this.toRecord(r)),
+      total,
+      page,
+      limit,
+    };
   }
 
+  /**
+   * Returns one dead-letter row by id, or throws `NotFoundException`.
+   *
+   * There is no nullable variant — every internal state-changing method
+   * (`replay`, `abandon`, `markReviewed`) funnels its existence check
+   * through here, so a missing id is always a 404, never a silent no-op.
+   */
   async get(id: string): Promise<FailedTransactionRecord> {
     const record = await this.prisma.failedTransaction.findUnique({
       where: { id },
@@ -106,6 +159,17 @@ export class DlqService {
     return this.toRecord(updated);
   }
 
+  /**
+   * Marks a dead-letter row `ABANDONED` — an operator has decided the
+   * failed operation will not be retried — and stamps `reviewedAt`.
+   *
+   * Terminal in practice: `replay` only acts on `PENDING_REVIEW` rows, so an
+   * abandoned row can no longer be replayed through this service. Unlike
+   * `replay` it does **not** check the current status, so calling it on an
+   * already-`REPLAYED` row would overwrite the status — callers should only
+   * abandon rows still pending review. Throws `NotFoundException` for an
+   * unknown id.
+   */
   async abandon(id: string): Promise<FailedTransactionRecord> {
     await this.requireRecord(id);
     const updated = await this.prisma.failedTransaction.update({
@@ -118,6 +182,14 @@ export class DlqService {
     return this.toRecord(updated);
   }
 
+  /**
+   * Stamps `reviewedAt` without changing `status` — an operator has looked
+   * at the row but is neither replaying nor abandoning it yet.
+   *
+   * Idempotent in effect (re-marking just moves the timestamp forward) and
+   * leaves the row eligible for a later `replay`. Throws `NotFoundException`
+   * for an unknown id.
+   */
   async markReviewed(id: string): Promise<FailedTransactionRecord> {
     await this.requireRecord(id);
     const updated = await this.prisma.failedTransaction.update({
@@ -133,9 +205,7 @@ export class DlqService {
     return this.get(id);
   }
 
-  private toRecord(
-    row: import('../prisma/prisma.service').FailedTransactionRecord,
-  ): FailedTransactionRecord {
-    return row;
+  private toRecord(row: PrismaFailedTransaction): FailedTransactionRecord {
+    return toFailedTransactionRecord(row);
   }
 }

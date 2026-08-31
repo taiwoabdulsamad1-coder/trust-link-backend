@@ -5,6 +5,7 @@ import { AppService } from './app.service';
 import { ConfigService } from './config/config.service';
 import { PrismaService } from './prisma/prisma.service';
 import { CacheService } from './cache/cache.service';
+import { HorizonService } from './stellar/horizon.service';
 
 function createMockResponse() {
   const res: Partial<Response> & {
@@ -56,6 +57,7 @@ describe('AppController', () => {
         { provide: ConfigService, useValue: mockConfigService },
         { provide: PrismaService, useValue: mockPrismaService },
         { provide: CacheService, useValue: { ping: cachePingMock } },
+        HorizonService,
       ],
     }).compile();
 
@@ -133,6 +135,29 @@ describe('AppController', () => {
         environment: 'test',
       });
       expect(typeof body.durationMs).toBe('number');
+    });
+
+    /**
+     * Regression guard for #563. The probe is polled by a load balancer on a
+     * short interval, so the query has to stay bounded. `findMany({})` returns
+     * every escrow row, which was cheap against the in-memory PrismaService
+     * fake and is an unbounded `SELECT *` against the real client.
+     */
+    it('queries the database with a bounded query, not every escrow row', async () => {
+      fetchSpy = jest
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue({ ok: true } as never);
+
+      const res = createMockResponse();
+      await appController.getReadiness(res);
+
+      expect(escrowFindManyMock).toHaveBeenCalledTimes(1);
+      const args = escrowFindManyMock.mock.calls[0][0] as {
+        take?: number;
+        select?: Record<string, boolean>;
+      };
+      expect(args.take).toBe(1);
+      expect(args.select).toEqual({ id: true });
     });
 
     it('returns 503 while the database is down', async () => {

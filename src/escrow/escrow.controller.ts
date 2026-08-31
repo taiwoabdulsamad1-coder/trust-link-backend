@@ -33,7 +33,11 @@ import { OpenDisputeDto } from './dto/open-dispute.dto';
 import { UpdateBuyerContactDto } from './dto/update-buyer-contact.dto';
 import { EscrowService } from './escrow.service';
 import { BuyerDisputeService } from './buyer-dispute.service';
-import { SkipThrottle, Throttle } from '@nestjs/throttler';
+import { Throttle } from '@nestjs/throttler';
+import {
+  EVIDENCE_UPLOAD_THROTTLE,
+  THROTTLE_WINDOW_MS,
+} from '../common/security/throttle.config';
 import { EscrowResponseDto } from './dto/escrow-response.dto';
 import { EscrowWithPaymentUrlResponseDto } from './dto/escrow-with-payment-url-response.dto';
 import { EvidenceUploadResponseDto } from './dto/evidence-upload.dto';
@@ -44,7 +48,6 @@ import { DisputeResponseDto } from './dto/dispute-response.dto';
 import { ErrorResponseDto } from '../common/dto/error-response.dto';
 
 @ApiTags('Escrow')
-@SkipThrottle({ auth: true }) // Skip auth limit for escrow endpoints
 @Controller('escrow')
 export class EscrowController {
   constructor(
@@ -53,7 +56,11 @@ export class EscrowController {
   ) {}
 
   /**
-   * Creates a new escrow in the FUNDED state.
+   * Creates a new escrow in the CREATED state.
+   *
+   * The escrow is initialized in CREATED state and awaits buyer payment.
+   * A payment URL is returned for the buyer to complete the on-chain funding.
+   * Once funded on-chain, the escrow transitions to FUNDED state.
    *
    * @param dto - Escrow details including item name, amount, currency and buyer address
    * @param user - Authenticated vendor making the request
@@ -65,7 +72,11 @@ export class EscrowController {
    * @authentication Requires valid SEP-10 JWT (vendor)
    * @rateLimit 10 requests per 60 seconds
    */
-  @ApiOperation({ summary: 'Create a new escrow transaction' })
+  @ApiOperation({
+    summary: 'Create a new escrow transaction',
+    description:
+      'Creates a new escrow in CREATED state with a payment URL for the buyer. The escrow transitions to FUNDED when the buyer completes the on-chain payment.',
+  })
   @ApiCreatedResponse({
     description: 'Escrow created successfully.',
     type: EscrowWithPaymentUrlResponseDto,
@@ -99,7 +110,7 @@ export class EscrowController {
   @Post()
   @HttpCode(HttpStatus.CREATED)
   @UseGuards(JwtGuard)
-  @Throttle({ public: { limit: 10, ttl: 60000 } })
+  @Throttle({ public: { limit: 10, ttl: THROTTLE_WINDOW_MS } })
   createEscrow(
     @Body() dto: CreateEscrowDto,
     @CurrentUser() user: AuthUser,
@@ -158,6 +169,7 @@ export class EscrowController {
   @Post('evidence-upload')
   @HttpCode(HttpStatus.CREATED)
   @UseGuards(JwtGuard)
+  @Throttle({ default: EVIDENCE_UPLOAD_THROTTLE })
   evidenceUpload(
     @Query('fileName') fileName: string,
     @CurrentUser() user: AuthUser,
@@ -227,7 +239,7 @@ export class EscrowController {
     type: ErrorResponseDto,
   })
   @Get(':id/events')
-  @Throttle({ public: { limit: 100, ttl: 60000 } })
+  @Throttle({ public: { limit: 100, ttl: THROTTLE_WINDOW_MS } })
   getEvents(@Param('id', ParseUUIDPipe) id: string) {
     return this.escrowService.getEvents(id);
   }
@@ -318,7 +330,7 @@ export class EscrowController {
   })
   @Patch(':id/buyer-contact')
   @HttpCode(HttpStatus.OK)
-  @Throttle({ public: { limit: 10, ttl: 60000 } })
+  @Throttle({ public: { limit: 10, ttl: THROTTLE_WINDOW_MS } })
   updateBuyerContact(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateBuyerContactDto,
@@ -384,7 +396,7 @@ export class EscrowController {
   @Patch(':id/ship')
   @HttpCode(HttpStatus.OK)
   @UseGuards(JwtGuard)
-  @Throttle({ public: { limit: 20, ttl: 60000 } })
+  @Throttle({ public: { limit: 20, ttl: THROTTLE_WINDOW_MS } })
   shipEscrow(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateShipmentDto,
@@ -399,7 +411,11 @@ export class EscrowController {
   }
 
   /**
-   * Cancels a FUNDED escrow. Only the buyer or vendor can cancel.
+   * Cancel a FUNDED escrow. Only the buyer, vendor, or admin may call this endpoint.
+   *
+   * Precondition: escrow must be in FUNDED state.
+   * Transitions escrow to CANCELLED state.
+   * See DELETE /escrow/:id for cancelling a CREATED (pending) escrow.
    *
    * @param id - UUID of the escrow to cancel
    * @param user - Authenticated caller (buyer or vendor)
@@ -410,7 +426,11 @@ export class EscrowController {
    * @authentication Requires valid SEP-10 JWT (buyer or vendor)
    * @rateLimit 10 requests per 60 seconds
    */
-  @ApiOperation({ summary: 'Cancel an active escrow transaction' })
+  @ApiOperation({
+    summary: 'Cancel a FUNDED escrow transaction',
+    description:
+      'Cancels a FUNDED escrow, transitioning it to CANCELLED state. Precondition: escrow must be in FUNDED state. Only the buyer, vendor, or admin can cancel. See DELETE /escrow/:id for cancelling a CREATED (pending) escrow.',
+  })
   @ApiOkResponse({
     description: 'Escrow cancelled.',
     type: EscrowResponseDto,
@@ -449,7 +469,7 @@ export class EscrowController {
   @Patch(':id/cancel')
   @HttpCode(HttpStatus.OK)
   @UseGuards(JwtGuard)
-  @Throttle({ public: { limit: 10, ttl: 60000 } })
+  @Throttle({ public: { limit: 10, ttl: THROTTLE_WINDOW_MS } })
   cancelEscrow(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthUser,
@@ -462,9 +482,13 @@ export class EscrowController {
   }
 
   /**
-   * Cancels a CREATED (pending) escrow with on-chain state verification.
-   * If the escrow has been funded on-chain, a refund is submitted before
-   * cancellation. Only the buyer or vendor can cancel.
+   * Cancel a CREATED (pending) escrow with on-chain state verification.
+   * Only the buyer, vendor, or admin may call this endpoint.
+   *
+   * Precondition: escrow must be in CREATED state (not yet funded).
+   * If the escrow has been funded on-chain, a refund is submitted before cancellation.
+   * Transitions escrow to CANCELLED state.
+   * See PATCH /escrow/:id/cancel for cancelling a FUNDED escrow.
    *
    * @param id - UUID of the escrow to cancel
    * @param user - Authenticated caller (buyer or vendor)
@@ -475,7 +499,11 @@ export class EscrowController {
    * @authentication Requires valid SEP-10 JWT (buyer or vendor)
    * @rateLimit 10 requests per 60 seconds
    */
-  @ApiOperation({ summary: 'Delete a pending (unfunded) escrow transaction' })
+  @ApiOperation({
+    summary: 'Cancel a CREATED (pending) escrow transaction',
+    description:
+      'Cancels a CREATED (pending) escrow, with on-chain state verification. If funded on-chain, a refund is submitted before cancellation. Precondition: escrow must be in CREATED state. Only the buyer, vendor, or admin can cancel. See PATCH /escrow/:id/cancel for cancelling a FUNDED escrow.',
+  })
   @ApiOkResponse({
     description: 'Pending escrow deleted.',
     type: EscrowResponseDto,
@@ -514,7 +542,7 @@ export class EscrowController {
   @Delete(':id')
   @HttpCode(HttpStatus.OK)
   @UseGuards(JwtGuard)
-  @Throttle({ public: { limit: 10, ttl: 60000 } })
+  @Throttle({ public: { limit: 10, ttl: THROTTLE_WINDOW_MS } })
   cancelPendingEscrow(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthUser,
@@ -584,7 +612,7 @@ export class EscrowController {
   @Post(':id/dispute')
   @HttpCode(HttpStatus.CREATED)
   @UseGuards(JwtGuard)
-  @Throttle({ public: { limit: 5, ttl: 60000 } })
+  @Throttle({ public: { limit: 5, ttl: THROTTLE_WINDOW_MS } })
   openDispute(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: OpenDisputeDto,
@@ -638,7 +666,7 @@ export class EscrowController {
   @ApiBearerAuth()
   @Get(':id/dispute')
   @UseGuards(JwtGuard)
-  @Throttle({ public: { limit: 30, ttl: 60000 } })
+  @Throttle({ public: { limit: 30, ttl: THROTTLE_WINDOW_MS } })
   getDispute(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthUser,

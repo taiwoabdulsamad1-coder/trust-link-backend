@@ -1,12 +1,34 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService as NestConfigService } from '@nestjs/config';
 
+/**
+ * Thrown by {@link ConfigService.requireAutoReleaseSourceAddress} when
+ * `AUTO_RELEASE_SOURCE_ADDRESS` is unset.
+ *
+ * A framework-neutral `Error` on purpose: the auto-release worker lets it
+ * propagate to its own catch-and-log handler, and `DlqController` catches it
+ * and rethrows `ServiceUnavailableException` to surface a 503. The two used
+ * to raise different exception types for the same misconfiguration (#672).
+ */
+export class AutoReleaseSourceNotConfiguredError extends Error {
+  constructor() {
+    super(
+      'AUTO_RELEASE_SOURCE_ADDRESS is not configured, so auto-release is unavailable.',
+    );
+    this.name = 'AutoReleaseSourceNotConfiguredError';
+  }
+}
+
 export interface Config {
   PORT: number;
   DATABASE_URL: string;
+  CONTACT_ENCRYPTION_KEY?: string;
+  CREDENTIAL_ENCRYPTION_KEY?: string;
   DB_POOL_CONNECTION_LIMIT?: number;
   DB_POOL_TIMEOUT_MS?: number;
   SEP10_JWT_SECRET: string;
+  /** Secret used to sign simulated S3 pre-signed evidence URLs (required). */
+  PRESIGN_SECRET: string;
   ADMIN_ADDRESS: string;
   AUTO_RELEASE_SOURCE_ADDRESS?: string;
   NODE_ENV: 'development' | 'production' | 'test';
@@ -14,6 +36,7 @@ export interface Config {
   TWILIO_ACCOUNT_SID?: string;
   TWILIO_AUTH_TOKEN?: string;
   STELLAR_NETWORK: 'TESTNET' | 'MAINNET';
+  STELLAR_HORIZON_URL?: string;
   ALLOWED_ORIGINS?: string;
   STELLAR_WEBHOOK_SECRET?: string;
   LOG_LEVEL?: string;
@@ -34,6 +57,13 @@ export interface Config {
   EVIDENCE_UPLOAD_TTL?: number;
   GIGL_API_BASE_URL?: string;
   GIGL_API_TOKEN?: string;
+  SOROBAN_RPC_URL?: string;
+  /** Always present: the config schema applies a validated default of 5000. */
+  SOROBAN_POLL_INTERVAL_MS: number;
+  /** Always present: the config schema applies a validated default of 4000. */
+  SOROBAN_RPC_TIMEOUT_MS: number;
+  SOROBAN_START_LEDGER?: number;
+  CONTRACT_ID?: string;
 }
 
 @Injectable()
@@ -54,7 +84,16 @@ export class ConfigService {
     return {
       PORT: this.get('PORT'),
       DATABASE_URL: this.get('DATABASE_URL'),
+      CONTACT_ENCRYPTION_KEY: this.nestConfigService.get(
+        'CONTACT_ENCRYPTION_KEY',
+        { infer: true },
+      ),
+      CREDENTIAL_ENCRYPTION_KEY: this.nestConfigService.get(
+        'CREDENTIAL_ENCRYPTION_KEY',
+        { infer: true },
+      ),
       SEP10_JWT_SECRET: this.get('SEP10_JWT_SECRET'),
+      PRESIGN_SECRET: this.get('PRESIGN_SECRET'),
       ADMIN_ADDRESS: this.get('ADMIN_ADDRESS'),
       AUTO_RELEASE_SOURCE_ADDRESS: this.nestConfigService.get(
         'AUTO_RELEASE_SOURCE_ADDRESS',
@@ -86,6 +125,8 @@ export class ConfigService {
       GIGL_API_TOKEN: this.nestConfigService.get('GIGL_API_TOKEN', {
         infer: true,
       }),
+      SOROBAN_POLL_INTERVAL_MS: this.get('SOROBAN_POLL_INTERVAL_MS'),
+      SOROBAN_RPC_TIMEOUT_MS: this.get('SOROBAN_RPC_TIMEOUT_MS'),
     };
   }
 
@@ -144,18 +185,58 @@ export class ConfigService {
     );
   }
 
-  /** Returns true when NODE_ENV is development. */
+  /**
+   * True when the app is running in the `development` environment.
+   *
+   * Reads the *validated* `NODE_ENV` (a `'development' | 'production' | 'test'`
+   * enum that defaults to `'development'` in the schema), not `process.env`
+   * directly — so this is the canonical environment check and cannot see an
+   * unrecognised value. Exactly one of `isDevelopment` / `isProduction` /
+   * `isTest` is true at a time.
+   */
   isDevelopment(): boolean {
     return this.get('NODE_ENV') === 'development';
   }
 
-  /** Returns true when NODE_ENV is production. */
+  /**
+   * True when the app is running in the `production` environment. See
+   * {@link isDevelopment} for how `NODE_ENV` is resolved. Prefer gating
+   * production-only strictness (required secrets, disabled dev shortcuts) on
+   * this rather than on `!isDevelopment()`, since `test` is neither.
+   */
   isProduction(): boolean {
     return this.get('NODE_ENV') === 'production';
   }
 
-  /** Returns true when NODE_ENV is test. */
+  /**
+   * True when the app is running under Jest (`NODE_ENV=test`). See
+   * {@link isDevelopment} for resolution. Used to gate test-only escape
+   * hatches such as `PrismaService.reset()` and the auto-release worker's
+   * `onModuleInit` no-op.
+   */
   isTest(): boolean {
     return this.get('NODE_ENV') === 'test';
+  }
+
+  /**
+   * Returns `AUTO_RELEASE_SOURCE_ADDRESS`, or throws
+   * {@link AutoReleaseSourceNotConfiguredError} when it is unset.
+   *
+   * Single source of truth for this check (#672) — it was duplicated in
+   * `DlqController` and `AutoReleaseWorker`, which disagreed about the
+   * failure (a 503 `ServiceUnavailableException` vs a plain `Error`).
+   * Resolved on use, never in a constructor: the variable is deliberately
+   * optional, so a boot-time throw would take the whole app down instead of
+   * just the affected path. Callers that need a 503 catch the error and
+   * translate it themselves.
+   */
+  requireAutoReleaseSourceAddress(): string {
+    const address = this.nestConfigService.get('AUTO_RELEASE_SOURCE_ADDRESS', {
+      infer: true,
+    });
+    if (!address) {
+      throw new AutoReleaseSourceNotConfiguredError();
+    }
+    return address;
   }
 }

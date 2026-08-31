@@ -1,9 +1,14 @@
 import { ServiceUnavailableException } from '@nestjs/common';
-import { Test, TestingModule } from '@nestjs/testing';
+import { Test } from '@nestjs/testing';
+import type { TestingModule } from '@nestjs/testing';
 import { DlqController } from './dlq.controller';
 import { DlqService } from './dlq.service';
 import { ContractService } from '../stellar/contract.service';
-import { ConfigService } from '../config/config.service';
+import { PrismaService } from '../prisma/prisma.service';
+import {
+  AutoReleaseSourceNotConfiguredError,
+  ConfigService,
+} from '../config/config.service';
 import { FailedTransactionRecord } from './dlq.types';
 
 describe('DlqController', () => {
@@ -38,6 +43,12 @@ describe('DlqController', () => {
 
     const config = {
       get: jest.fn().mockReturnValue(autoReleaseSourceAddress),
+      requireAutoReleaseSourceAddress: jest.fn((): string => {
+        if (!autoReleaseSourceAddress) {
+          throw new AutoReleaseSourceNotConfiguredError();
+        }
+        return autoReleaseSourceAddress;
+      }),
     } as unknown as jest.Mocked<ConfigService>;
 
     const moduleRef: TestingModule = await Test.createTestingModule({
@@ -46,6 +57,18 @@ describe('DlqController', () => {
         { provide: DlqService, useValue: dlq },
         { provide: ContractService, useValue: contract },
         { provide: ConfigService, useValue: config },
+        {
+          // Replay translates the DLQ record's backend UUID to the contract's
+          // own u64 before calling auto_release.
+          provide: PrismaService,
+          useValue: {
+            escrow: {
+              findUnique: jest.fn().mockResolvedValue({
+                contractEscrowId: 42n,
+              }),
+            },
+          },
+        },
       ],
     }).compile();
 
@@ -106,8 +129,10 @@ describe('DlqController', () => {
 
       const result = await controller.replay('failed-tx-1');
 
+      // Replay translates the record's backend UUID to the contract's u64
+      // before calling auto_release; the mocked lookup returns 42n.
       expect(contract.submitAutoRelease).toHaveBeenCalledWith(
-        'escrow-123',
+        42n,
         'GAUTORELEASESOURCEADDRESS0000000000000000000000000000',
       );
       expect(result.status).toBe('REPLAYED');
@@ -153,35 +178,47 @@ describe('DlqController', () => {
   });
 
   describe('GET /admin/dlq', () => {
-    it('passes query filters to dlq.list()', async () => {
+    it('passes query filters, page, and limit to dlq.list()', async () => {
       const { controller, dlq } = await buildController(
         'GAUTORELEASESOURCEADDRESS0000000000000000000000000000',
       );
-      dlq.list.mockResolvedValue([autoReleaseRecord]);
+      const paginated = {
+        data: [autoReleaseRecord],
+        total: 1,
+        page: 2,
+        limit: 10,
+      };
+      dlq.list.mockResolvedValue(paginated);
 
       const result = await controller.list(
         'PENDING_REVIEW',
         'submitAutoRelease',
         'escrow-123',
+        '2',
+        '10',
       );
 
       expect(dlq.list).toHaveBeenCalledWith({
         status: 'PENDING_REVIEW',
         operation: 'submitAutoRelease',
         escrowId: 'escrow-123',
+        page: 2,
+        limit: 10,
       });
-      expect(result).toEqual([autoReleaseRecord]);
+      expect(result).toEqual(paginated);
     });
 
     it('passes empty query when no filters are provided', async () => {
       const { controller, dlq } = await buildController(
         'GAUTORELEASESOURCEADDRESS0000000000000000000000000000',
       );
-      dlq.list.mockResolvedValue([]);
+      const emptyPaginated = { data: [], total: 0, page: 1, limit: 20 };
+      dlq.list.mockResolvedValue(emptyPaginated);
 
-      await controller.list();
+      const result = await controller.list();
 
       expect(dlq.list).toHaveBeenCalledWith({});
+      expect(result).toEqual(emptyPaginated);
     });
   });
 
@@ -207,7 +244,7 @@ describe('DlqController', () => {
       const abandonedRecord = {
         ...autoReleaseRecord,
         status: 'ABANDONED',
-      };
+      } as FailedTransactionRecord;
       dlq.abandon.mockResolvedValue(abandonedRecord);
 
       const result = await controller.abandon('failed-tx-1');

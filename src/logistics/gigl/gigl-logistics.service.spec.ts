@@ -9,12 +9,14 @@
  * GiglClient is fully mocked so no HTTP calls are made.
  */
 
+import { Logger } from '@nestjs/common';
 import { GiglLogisticsService } from './gigl-logistics.service';
 import {
   GiglClient,
   GiglUnauthorizedError,
   GiglNetworkError,
   GiglProviderError,
+  GiglInvalidResponseError,
 } from './gigl.client';
 import { GiglTrackingResponse } from './gigl.types';
 
@@ -301,7 +303,10 @@ describe('GiglLogisticsService', () => {
     it('fails clearly and logs a warning when constructed without a client', async () => {
       const unconfiguredService = new GiglLogisticsService(null);
       const loggerSpy = jest
-        .spyOn((unconfiguredService as any).logger, 'warn')
+        .spyOn(
+          (unconfiguredService as unknown as { logger: Logger }).logger,
+          'warn',
+        )
         .mockImplementation();
 
       await unconfiguredService.onModuleInit();
@@ -351,6 +356,18 @@ describe('GiglLogisticsService', () => {
 
       await expect(service.getTrackingDetails('TRK-ERR')).rejects.toThrow(
         GiglProviderError,
+      );
+    });
+
+    it('propagates GiglInvalidResponseError from getTrackingDetails when the upstream returns a malformed body', async () => {
+      const error = new GiglInvalidResponseError(
+        'TRK-SHAPE-2',
+        'response body is missing one or more required fields',
+      );
+      client.fetchTracking.mockRejectedValue(error);
+
+      await expect(service.getTrackingDetails('TRK-SHAPE-2')).rejects.toThrow(
+        GiglInvalidResponseError,
       );
     });
   });
